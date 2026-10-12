@@ -26,6 +26,19 @@ jobs:
 
       - name: Terraform format
         run: terraform fmt -check -recursive terraform
+   
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v4
+
+      - name: Run TFLint
+        run: |
+          tflint --init
+          tflint --recursive
+
+      - name: Run Checkov security scan
+        run: |
+          python -m pip install checkov
+          checkov -d terraform --soft-fail
 
       - name: Validate Azure dev
         working-directory: terraform/environments/dev
@@ -65,5 +78,14 @@ jobs:
       - name: Install dependencies
         run: pip install -r app/requirements.txt
 
+      
       - name: Build Docker image
         run: docker build --build-arg GIT_COMMIT=${{ github.sha }} -t hellovibe-api:${{ github.sha }} ./app
+
+      - name: Scan Docker image with Trivy
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: hellovibe-api:${{ github.sha }}
+          format: table
+          severity: HIGH,CRITICAL
+          exit-code: "1"
