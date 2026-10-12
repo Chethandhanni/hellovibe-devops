@@ -204,6 +204,7 @@ jobs:
           grep -F "${{ github.sha }}" /tmp/version.json
 
 
+  
   deploy-production:
     name: Promote to Production
     runs-on: ubuntu-latest
@@ -213,42 +214,137 @@ jobs:
     permissions:
       contents: read
       packages: read
+      actions: read
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Find previous successful production release
+        id: previous
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const runs = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'ci-cd.yml',
+              branch: 'main',
+              status: 'success',
+              per_page: 20
+            });
+
+            for (const run of runs.data.workflow_runs) {
+              if (run.id === context.runId) continue;
+
+              const result = await github.rest.actions.listWorkflowRunArtifacts({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: run.id
+              });
+
+              const artifact = result.data.artifacts.find(
+                item => item.name === 'production-sha' && !item.expired
+              );
+
+              if (artifact) {
+                core.setOutput('run_id', String(run.id));
+                core.info(`Previous production release found in run ${run.id}`);
+                return;
+              }
+            }
+
+            core.setOutput('run_id', '');
+            core.info('No previous production release found. This may be the first deployment.');
+
+      - name: Download previous production SHA
+        if: steps.previous.outputs.run_id != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: production-sha
+          run-id: ${{ steps.previous.outputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: ./previous-production
+
+      - name: Read previous production SHA
+        id: previous-sha
+        shell: bash
+        run: |
+          if [ -f ./previous-production/production-sha.txt ]; then
+            SHA=$(tr -d '\r\n' < ./previous-production/production-sha.txt)
+            echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+            echo "Previous production SHA: $SHA"
+          else
+            echo "sha=" >> "$GITHUB_OUTPUT"
+            echo "No previous production SHA is available."
+          fi
+
       - name: Set image name
         id: image
+        shell: bash
         run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
 
-      - name: Login to GHCR
+      - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Pull promoted image
-        run: docker pull "${{ steps.image.outputs.name }}:${{ github.sha }}"
+      - name: Pull current image
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: docker pull "$IMAGE:$CURRENT_SHA"
+
+      - name: Pull previous production image
+        if: steps.previous-sha.outputs.sha != ''
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          PREVIOUS_SHA: ${{ steps.previous-sha.outputs.sha }}
+        run: docker pull "$IMAGE:$PREVIOUS_SHA"
 
       - name: Create temporary Kubernetes cluster
         uses: helm/kind-action@v1.10.0
         with:
           cluster_name: kind
 
-      - name: Load image into kind
-        run: kind load docker-image "${{ steps.image.outputs.name }}:${{ github.sha }}"
+      - name: Load current image into kind
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: kind load docker-image "$IMAGE:$CURRENT_SHA"
+
+      - name: Load previous image into kind
+        if: steps.previous-sha.outputs.sha != ''
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          PREVIOUS_SHA: ${{ steps.previous-sha.outputs.sha }}
+        run: kind load docker-image "$IMAGE:$PREVIOUS_SHA"
 
       - name: Set up Helm
         uses: azure/setup-helm@v4
 
-      - name: Install baseline release
+      - name: Install previous release as rollback baseline
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          CURRENT_SHA: ${{ github.sha }}
+          PREVIOUS_SHA: ${{ steps.previous-sha.outputs.sha }}
+        shell: bash
         run: |
+          BASELINE_SHA="$CURRENT_SHA"
+
+          if [ -n "$PREVIOUS_SHA" ]; then
+            BASELINE_SHA="$PREVIOUS_SHA"
+            echo "Using previous production image as rollback baseline."
+          else
+            echo "First deployment: no previous version exists to roll back to."
+          fi
+
           helm upgrade --install hellovibe-prod ./k8s/chart \
             --namespace production --create-namespace \
-            --set-string image.repository="${{ steps.image.outputs.name }}" \
-            --set-string image.tag="${{ github.sha }}" \
+            --set-string image.repository="$IMAGE" \
+            --set-string image.tag="$BASELINE_SHA" \
             --set image.pullPolicy=IfNotPresent \
             --set replicaCount=2 \
             --set autoscaling.enabled=false
@@ -256,12 +352,15 @@ jobs:
           kubectl rollout status deployment/hellovibe-prod \
             -n production --timeout=180s
 
-      - name: Promote image
+      - name: Promote current image
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          CURRENT_SHA: ${{ github.sha }}
         run: |
           helm upgrade hellovibe-prod ./k8s/chart \
             --namespace production \
-            --set-string image.repository="${{ steps.image.outputs.name }}" \
-            --set-string image.tag="${{ github.sha }}" \
+            --set-string image.repository="$IMAGE" \
+            --set-string image.tag="$CURRENT_SHA" \
             --set image.pullPolicy=IfNotPresent \
             --set replicaCount=2 \
             --set autoscaling.enabled=false
@@ -271,38 +370,82 @@ jobs:
 
       - name: Production smoke test and rollback
         shell: bash
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          CURRENT_SHA: ${{ github.sha }}
+          PREVIOUS_SHA: ${{ steps.previous-sha.outputs.sha }}
         run: |
-          set +e
+          SMOKE_OK=true
 
           kubectl port-forward -n production svc/hellovibe-prod 18081:8080 \
             > /tmp/prod-port-forward.log 2>&1 &
           PF_PID=$!
+          trap 'kill "$PF_PID" 2>/dev/null || true' EXIT
 
-          PASS=false
+          READY=false
           for i in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:18081/healthz >/dev/null; then
-              PASS=true
+              READY=true
               break
             fi
             sleep 2
           done
 
-          if [ "$PASS" = true ]; then
-            curl -fsS http://127.0.0.1:18081/version | tee /tmp/prod-version.json
-            grep -F "${{ github.sha }}" /tmp/prod-version.json
-            PASS=$?
+          if [ "$READY" != "true" ]; then
+            echo "Production health check failed."
+            SMOKE_OK=false
           else
-            PASS=1
+            if ! curl -fsS http://127.0.0.1:18081/version \
+              | tee /tmp/prod-version.json \
+              | grep -F "$CURRENT_SHA"; then
+              echo "Production version check failed."
+              SMOKE_OK=false
+            fi
           fi
 
-          kill "$PF_PID" 2>/dev/null || true
+          if [ "$SMOKE_OK" != "true" ]; then
+            if [ -n "$PREVIOUS_SHA" ]; then
+              echo "Rolling back to previous production image: $PREVIOUS_SHA"
 
-          if [ "$PASS" -ne 0 ]; then
-            echo "Production smoke test failed. Rolling back Helm release."
-            helm rollback hellovibe-prod 1 -n production --wait --timeout=180s
-            kubectl rollout status deployment/hellovibe-prod \
-              -n production --timeout=180s
+              helm rollback hellovibe-prod 1 \
+                -n production --wait --timeout=180s
+
+              kubectl rollout status deployment/hellovibe-prod \
+                -n production --timeout=180s
+
+              ACTUAL_IMAGE=$(kubectl get deployment hellovibe-prod \
+                -n production \
+                -o jsonpath='{.spec.template.spec.containers[0].image}')
+
+              EXPECTED_IMAGE="$IMAGE:$PREVIOUS_SHA"
+
+              if [ "$ACTUAL_IMAGE" != "$EXPECTED_IMAGE" ]; then
+                echo "Rollback verification failed."
+                echo "Expected: $EXPECTED_IMAGE"
+                echo "Actual: $ACTUAL_IMAGE"
+                exit 1
+              fi
+
+              echo "Rollback verified: $ACTUAL_IMAGE"
+            else
+              echo "No previous successful production release exists."
+              echo "Automatic rollback is not possible on the initial release."
+            fi
+
             exit 1
           fi
 
           echo "Production smoke test passed."
+
+      - name: Record successful production SHA
+        if: success()
+        run: echo "${{ github.sha }}" > production-sha.txt
+
+      - name: Save successful production SHA for next release
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-sha
+          path: production-sha.txt
+          retention-days: 90
+          if-no-files-found: error
