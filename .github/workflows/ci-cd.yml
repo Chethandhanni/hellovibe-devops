@@ -132,3 +132,173 @@ jobs:
 
       - name: Push image to GHCR
         run: docker push "${{ steps.image.outputs.name }}:${{ github.sha }}"
+
+
+  deploy-dev:
+    name: Deploy to Dev on kind
+    runs-on: ubuntu-latest
+    needs: [publish-image]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set image name
+        id: image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull published image
+        run: docker pull "${{ steps.image.outputs.name }}:${{ github.sha }}"
+
+      - name: Create temporary Kubernetes cluster
+        uses: helm/kind-action@v1.10.0
+
+      - name: Load image into kind
+        run: kind load docker-image "${{ steps.image.outputs.name }}:${{ github.sha }}"
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Deploy to dev
+        run: |
+          helm upgrade --install hellovibe-dev ./k8s/chart \
+            --namespace dev --create-namespace \
+            --set-string image.repository="${{ steps.image.outputs.name }}" \
+            --set-string image.tag="${{ github.sha }}" \
+            --set image.pullPolicy=IfNotPresent \
+            --set replicaCount=1 \
+            --set autoscaling.enabled=false
+
+          kubectl rollout status deployment/hellovibe-dev \
+            -n dev --timeout=180s
+
+      - name: Smoke test dev
+        run: |
+          kubectl port-forward -n dev svc/hellovibe-dev 18080:8080 \
+            > /tmp/dev-port-forward.log 2>&1 &
+          PF_PID=$!
+          trap 'kill "$PF_PID" 2>/dev/null || true' EXIT
+
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18080/healthz; then
+              break
+            fi
+            sleep 2
+          done
+
+          curl -fsS http://127.0.0.1:18080/healthz
+          curl -fsS http://127.0.0.1:18080/version | tee /tmp/version.json
+          grep -F "${{ github.sha }}" /tmp/version.json
+
+
+  deploy-production:
+    name: Promote to Production
+    runs-on: ubuntu-latest
+    needs: [deploy-dev]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: production
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set image name
+        id: image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull promoted image
+        run: docker pull "${{ steps.image.outputs.name }}:${{ github.sha }}"
+
+      - name: Create temporary Kubernetes cluster
+        uses: helm/kind-action@v1.10.0
+
+      - name: Load image into kind
+        run: kind load docker-image "${{ steps.image.outputs.name }}:${{ github.sha }}"
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Install baseline release
+        run: |
+          helm upgrade --install hellovibe-prod ./k8s/chart \
+            --namespace production --create-namespace \
+            --set-string image.repository="${{ steps.image.outputs.name }}" \
+            --set-string image.tag="${{ github.sha }}" \
+            --set image.pullPolicy=IfNotPresent \
+            --set replicaCount=2 \
+            --set autoscaling.enabled=false
+
+          kubectl rollout status deployment/hellovibe-prod \
+            -n production --timeout=180s
+
+      - name: Promote image
+        run: |
+          helm upgrade hellovibe-prod ./k8s/chart \
+            --namespace production \
+            --set-string image.repository="${{ steps.image.outputs.name }}" \
+            --set-string image.tag="${{ github.sha }}" \
+            --set image.pullPolicy=IfNotPresent \
+            --set replicaCount=2 \
+            --set autoscaling.enabled=false
+
+          kubectl rollout status deployment/hellovibe-prod \
+            -n production --timeout=180s
+
+      - name: Production smoke test and rollback
+        shell: bash
+        run: |
+          set +e
+
+          kubectl port-forward -n production svc/hellovibe-prod 18081:8080 \
+            > /tmp/prod-port-forward.log 2>&1 &
+          PF_PID=$!
+
+          PASS=false
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18081/healthz >/dev/null; then
+              PASS=true
+              break
+            fi
+            sleep 2
+          done
+
+          if [ "$PASS" = true ]; then
+            curl -fsS http://127.0.0.1:18081/version | tee /tmp/prod-version.json
+            grep -F "${{ github.sha }}" /tmp/prod-version.json
+            PASS=$?
+          else
+            PASS=1
+          fi
+
+          kill "$PF_PID" 2>/dev/null || true
+
+          if [ "$PASS" -ne 0 ]; then
+            echo "Production smoke test failed. Rolling back Helm release."
+            helm rollback hellovibe-prod 1 -n production --wait --timeout=180s
+            kubectl rollout status deployment/hellovibe-prod \
+              -n production --timeout=180s
+            exit 1
+          fi
+
+          echo "Production smoke test passed."
