@@ -17,6 +17,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
+
 RUN useradd --create-home --uid 10001 appuser
 
 COPY --from=builder /install /usr/local
