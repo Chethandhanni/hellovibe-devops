@@ -1,0 +1,13 @@
+
+replicaCount: 1
+
+image:
+  repository: hellovibe-api
+  tag: dev
+  pullPolicy: IfNotPresent
+
+autoscaling:
+  enabled: true
+  minReplicas: 1
+  maxReplicas: 3
+  targetCPUUtilizationPercentage: 70
