@@ -163,6 +163,8 @@ jobs:
 
       - name: Create temporary Kubernetes cluster
         uses: helm/kind-action@v1.10.0
+        with:
+          cluster_name: kind
 
       - name: Load image into kind
         run: kind load docker-image "${{ steps.image.outputs.name }}:${{ github.sha }}"
@@ -232,6 +234,8 @@ jobs:
 
       - name: Create temporary Kubernetes cluster
         uses: helm/kind-action@v1.10.0
+        with:
+          cluster_name: kind
 
       - name: Load image into kind
         run: kind load docker-image "${{ steps.image.outputs.name }}:${{ github.sha }}"
